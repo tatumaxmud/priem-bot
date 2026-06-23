@@ -1,0 +1,27 @@
+# Render Blueprint — автоматическая настройка сервиса.
+# Render: New + → Blueprint → подключите репозиторий с этим файлом.
+# После создания задайте значения переменных BOT_TOKEN, ADMIN_IDS, AI_API_KEY
+# в разделе Environment сервиса.
+
+services:
+  - type: web
+    name: priem-bot
+    runtime: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python run_render.py"
+    envVars:
+      - key: BOT_TOKEN
+        sync: false          # задать вручную в настройках (секрет)
+      - key: ADMIN_IDS
+        sync: false
+      - key: AI_API_KEY
+        sync: false          # ключ Groq для умных ответов (можно оставить пустым)
+      - key: AI_BASE_URL
+        value: "https://api.groq.com/openai/v1"
+      - key: AI_MODEL
+        value: "llama-3.3-70b-versatile"
+      - key: KNOWLEDGE_FILE
+        value: "knowledge.md"
+      - key: PYTHON_VERSION
+        value: "3.11.9"
