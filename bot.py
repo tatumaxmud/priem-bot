@@ -3,13 +3,18 @@
 Telegram-бот приёмной комиссии (24/7) с ИИ-ответами по базе знаний и админ-панелью.
 Филиал АГТУ в Ташкентской области Республики Узбекистан.
 
-Запуск:  python bot.py
-Все настройки берутся из переменных окружения (файл .env). См. README.md.
+Хранилище статистики:
+  - по умолчанию — локальный файл SQLite (bot.db). На бесплатном Render он
+    обнуляется при перезапуске.
+  - если задана переменная окружения DATABASE_URL (PostgreSQL, например Neon),
+    статистика хранится в ней и НЕ теряется при перезапуске.
+
+Запуск:  python bot.py   (или run_render.py на Render)
+Настройки берутся из переменных окружения (файл .env). См. README.md.
 """
 
 import os
 import re
-import sqlite3
 import logging
 import threading
 from datetime import datetime
@@ -33,6 +38,7 @@ AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.groq.com/openai/v1").strip()
 AI_MODEL = os.getenv("AI_MODEL", "llama-3.3-70b-versatile").strip()
 KNOWLEDGE_FILE = os.getenv("KNOWLEDGE_FILE", "knowledge.md").strip()
 DB_FILE = os.getenv("DB_FILE", "bot.db").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 if not BOT_TOKEN:
     raise SystemExit("Не задан BOT_TOKEN. Создайте файл .env (см. .env.example) и укажите токен.")
@@ -44,7 +50,7 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 # ------------------------- База знаний -------------------------
 KNOWLEDGE = ""
-SECTIONS = {}  # {"Заголовок": "текст раздела"}
+SECTIONS = {}
 
 
 def load_knowledge():
@@ -76,7 +82,6 @@ def load_knowledge():
 
 load_knowledge()
 
-# Кнопка меню -> ключевое слово для поиска раздела в knowledge.md
 MENU = [
     ("📅 Сроки приёма", "Сроки приёма"),
     ("💰 Стоимость обучения", "Стоимость обучения"),
@@ -96,52 +101,118 @@ def find_section(keyword):
     return None, None
 
 
-# ------------------------- Хранилище (SQLite) -------------------------
+# ------------------------- Хранилище (SQLite или PostgreSQL) -------------------------
 _db_lock = threading.Lock()
+USE_PG = DATABASE_URL.startswith("postgres")
+PH = "%s" if USE_PG else "?"  # стиль плейсхолдеров
+
+if USE_PG:
+    import psycopg2
+    log.info("Хранилище: PostgreSQL (постоянное)")
+else:
+    import sqlite3
+    log.info("Хранилище: SQLite (%s)", DB_FILE)
 
 
-def db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("""CREATE TABLE IF NOT EXISTS users(
-        id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
-        joined TEXT, last_seen TEXT, msg_count INTEGER DEFAULT 0)""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS questions(
-        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
-        text TEXT, ts TEXT)""")
-    return conn
+def get_conn():
+    if USE_PG:
+        return psycopg2.connect(DATABASE_URL, sslmode="require")
+    return sqlite3.connect(DB_FILE)
+
+
+def init_db():
+    serial = "SERIAL" if USE_PG else "INTEGER"
+    bigint = "BIGINT" if USE_PG else "INTEGER"
+    with _db_lock:
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(f"""CREATE TABLE IF NOT EXISTS users(
+                id {bigint} PRIMARY KEY, username TEXT, first_name TEXT,
+                joined TEXT, last_seen TEXT, msg_count INTEGER DEFAULT 0)""")
+            cur.execute(f"""CREATE TABLE IF NOT EXISTS questions(
+                id {serial} PRIMARY KEY, user_id {bigint}, text TEXT, ts TEXT)""")
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def track(user):
     now = datetime.utcnow().isoformat(timespec="seconds")
-    with _db_lock, db() as conn:
-        row = conn.execute("SELECT id FROM users WHERE id=?", (user.id,)).fetchone()
-        if row:
-            conn.execute("UPDATE users SET last_seen=?, msg_count=msg_count+1, username=?, first_name=? WHERE id=?",
-                         (now, user.username, user.first_name, user.id))
-        else:
-            conn.execute("INSERT INTO users(id, username, first_name, joined, last_seen, msg_count) VALUES(?,?,?,?,?,1)",
-                         (user.id, user.username, user.first_name, now, now))
+    q = (f"INSERT INTO users(id, username, first_name, joined, last_seen, msg_count) "
+         f"VALUES({PH},{PH},{PH},{PH},{PH},1) "
+         f"ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen, "
+         f"msg_count=users.msg_count+1, username=excluded.username, "
+         f"first_name=excluded.first_name")
+    with _db_lock:
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(q, (user.id, user.username, user.first_name, now, now))
+            conn.commit()
+        except Exception as e:
+            log.error("track error: %s", e)
+        finally:
+            conn.close()
 
 
 def log_question(user_id, text):
-    with _db_lock, db() as conn:
-        conn.execute("INSERT INTO questions(user_id, text, ts) VALUES(?,?,?)",
-                     (user_id, text[:1000], datetime.utcnow().isoformat(timespec="seconds")))
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    with _db_lock:
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(f"INSERT INTO questions(user_id, text, ts) VALUES({PH},{PH},{PH})",
+                        (user_id, text[:1000], now))
+            conn.commit()
+        except Exception as e:
+            log.error("log_question error: %s", e)
+        finally:
+            conn.close()
 
 
 def all_user_ids():
-    with _db_lock, db() as conn:
-        return [r[0] for r in conn.execute("SELECT id FROM users").fetchall()]
+    with _db_lock:
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM users")
+            return [r[0] for r in cur.fetchall()]
+        finally:
+            conn.close()
 
 
 def stats():
-    with _db_lock, db() as conn:
-        users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        msgs = conn.execute("SELECT COALESCE(SUM(msg_count),0) FROM users").fetchone()[0]
-        questions = conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0]
-        last = conn.execute("SELECT text, ts FROM questions ORDER BY id DESC LIMIT 5").fetchall()
-    return users, msgs, questions, last
+    with _db_lock:
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM users")
+            users = cur.fetchone()[0]
+            cur.execute("SELECT COALESCE(SUM(msg_count),0) FROM users")
+            msgs = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM questions")
+            questions = cur.fetchone()[0]
+            cur.execute("SELECT text, ts FROM questions ORDER BY id DESC LIMIT 5")
+            last = cur.fetchall()
+            return users, msgs, questions, last
+        finally:
+            conn.close()
 
+
+def list_users(limit=50):
+    with _db_lock:
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(f"SELECT first_name, username, msg_count, joined "
+                        f"FROM users ORDER BY msg_count DESC LIMIT {int(limit)}")
+            return cur.fetchall()
+        finally:
+            conn.close()
+
+
+init_db()
 
 # ------------------------- ИИ -------------------------
 SYSTEM_PROMPT = (
@@ -164,7 +235,6 @@ if AI_API_KEY:
 
 
 def ai_answer(question):
-    """Возвращает ответ ИИ или None, если ИИ недоступен/ошибка."""
     if not _ai_client:
         return None
     try:
@@ -174,8 +244,7 @@ def ai_answer(question):
                 {"role": "system", "content": SYSTEM_PROMPT.format(kb=KNOWLEDGE)},
                 {"role": "user", "content": question},
             ],
-            temperature=0.2,
-            max_tokens=700,
+            temperature=0.2, max_tokens=700,
         )
         return resp.choices[0].message.content.strip()
     except Exception as e:
@@ -183,7 +252,6 @@ def ai_answer(question):
         return None
 
 
-# Подсказки тема -> ключевое слово раздела (для запасного поиска без ИИ)
 INTENT_HINTS = [
     (("зачисл", "конкурс", "рейтинг", "договор"), "Конкурс и зачисление"),
     (("документ", "паспорт", "заявлен", "фото", "подать", "подач", "сдать докум"), "Необходимые документы"),
@@ -199,7 +267,6 @@ INTENT_HINTS = [
 
 
 def keyword_fallback(question):
-    """Простой поиск по разделам, если ИИ недоступен."""
     q = question.lower()
     for triggers, key in INTENT_HINTS:
         if any(t in q for t in triggers):
@@ -216,7 +283,7 @@ def keyword_fallback(question):
     if best and score:
         return f"<b>{best[0]}</b>\n{best[1]}"
     return ("Я не нашёл точного ответа в базе. Воспользуйтесь меню /start "
-            "или обратитесь в приёмную комиссию (контакты — кнопка «Контакты»).")
+            "или обратитесь в приёмную комиссию (кнопка «Контакты»).")
 
 
 # ------------------------- Клавиатуры -------------------------
@@ -229,7 +296,6 @@ def main_menu():
 
 
 def send_long(chat_id, text, **kw):
-    """Отправляет длинный текст частями (лимит Telegram 4096)."""
     for i in range(0, len(text), 4000):
         bot.send_message(chat_id, text[i:i + 4000], **kw)
 
@@ -253,18 +319,17 @@ def cmd_help(m):
     txt = ("ℹ️ <b>Как пользоваться</b>\n"
            "• /start — главное меню с разделами\n"
            "• Просто напишите вопрос своими словами — я отвечу.\n\n"
-           "Примеры: «Когда начинается приём?», «Сколько стоит экономика?», "
-           "«Какие экзамены на аквакультуру?»")
+           "Примеры: «Когда начинается приём?», «Сколько стоит экономика?»")
     if m.from_user.id in ADMIN_IDS:
         txt += ("\n\n🔐 <b>Команды администратора</b>\n"
                 "• /admin — панель администратора\n"
                 "• /stats — статистика\n"
+                "• /users — список пользователей\n"
                 "• /reload — перечитать базу знаний\n"
                 "• /broadcast текст — рассылка всем пользователям")
     bot.send_message(m.chat.id, txt)
 
 
-# ----- Админ -----
 def is_admin(uid):
     return uid in ADMIN_IDS
 
@@ -274,17 +339,16 @@ def cmd_admin(m):
     if not is_admin(m.from_user.id):
         return
     u, msgs, q, _ = stats()
+    storage = "PostgreSQL (постоянно)" if USE_PG else "SQLite (сбрасывается при перезапуске)"
     bot.send_message(
         m.chat.id,
         f"🔐 <b>Панель администратора</b>\n\n"
         f"👥 Пользователей: <b>{u}</b>\n"
         f"💬 Сообщений: <b>{msgs}</b>\n"
         f"❓ Вопросов задано: <b>{q}</b>\n\n"
-        f"Команды:\n"
-        f"• /stats — подробная статистика\n"
-        f"• /reload — обновить базу знаний\n"
-        f"• /broadcast текст — отправить сообщение всем\n"
-        f"ИИ: {'включён ✅ (' + AI_MODEL + ')' if _ai_client else 'выключен ❌ (работает поиск по базе)'}",
+        f"Команды: /stats, /users, /broadcast, /reload\n"
+        f"ИИ: {'включён ✅' if _ai_client else 'выключен ❌ (поиск по базе)'}\n"
+        f"Хранилище: {storage}",
     )
 
 
@@ -296,6 +360,23 @@ def cmd_stats(m):
     txt = f"📊 <b>Статистика</b>\n👥 {u} | 💬 {msgs} | ❓ {q}\n\n<b>Последние вопросы:</b>\n"
     txt += "\n".join(f"• {t}" for t, ts in last) or "—"
     bot.send_message(m.chat.id, txt)
+
+
+@bot.message_handler(commands=["users"])
+def cmd_users(m):
+    if not is_admin(m.from_user.id):
+        return
+    rows = list_users(50)
+    if not rows:
+        bot.send_message(m.chat.id, "Пока нет пользователей.")
+        return
+    lines = ["👥 <b>Пользователи бота</b> (топ по активности):", ""]
+    for i, (first, username, cnt, joined) in enumerate(rows, 1):
+        name = first or "—"
+        uname = f" (@{username})" if username else ""
+        day = (joined or "")[:10]
+        lines.append(f"{i}. {name}{uname} — {cnt} сообщ.{' · с ' + day if day else ''}")
+    send_long(m.chat.id, "\n".join(lines))
 
 
 @bot.message_handler(commands=["reload"])
@@ -325,7 +406,6 @@ def cmd_broadcast(m):
     bot.send_message(m.chat.id, f"📣 Рассылка завершена. Отправлено: {sent}, не доставлено: {failed}.")
 
 
-# ----- Кнопки -----
 @bot.callback_query_handler(func=lambda c: True)
 def on_callback(c):
     track(c.from_user)
@@ -343,7 +423,6 @@ def on_callback(c):
             bot.send_message(c.message.chat.id, "Раздел пока не заполнен.")
 
 
-# ----- Свободные вопросы -----
 @bot.message_handler(content_types=["text"])
 def on_text(m):
     track(m.from_user)
