@@ -116,7 +116,9 @@ else:
 
 def get_conn():
     if USE_PG:
-        return psycopg2.connect(DATABASE_URL, sslmode="require")
+        # URL уже содержит sslmode=require; передаём строку целиком без доп. kwargs,
+        # иначе psycopg2 неверно разбирает URI (берёт имя пользователя за хост).
+        return psycopg2.connect(DATABASE_URL)
     return sqlite3.connect(DB_FILE)
 
 
